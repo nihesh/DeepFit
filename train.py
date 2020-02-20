@@ -17,8 +17,7 @@ NUM_SAMPLES = 10000
 
 # DGSAC Arguments
 TOPK = 60
-NUM_HYPOTHESIS = 1000
-REDUCED_FEATURE_SIZE = 100
+NUM_HYPOTHESIS = 100
 
 # Training Arugments
 FEATURE_MAP_SCALE = 4
@@ -67,7 +66,7 @@ if(__name__ == "__main__"):
 
 	ResetWorkspace()
 	
-	dataset = dataset.DataReader(DATA_ROOT, TYPE, NUM_SAMPLES, TOPK, NUM_HYPOTHESIS, REDUCED_FEATURE_SIZE)
+	dataset = dataset.DataReader(DATA_ROOT, TYPE, NUM_SAMPLES, TOPK, NUM_HYPOTHESIS)
 	dataloader = torch.utils.data.DataLoader(dataset, batch_size = BATCH_SIZE, shuffle = True, num_workers = NUM_WORKERS)
 
 	# Visualise Density/Residual features for hand crafted feature space
@@ -79,7 +78,7 @@ if(__name__ == "__main__"):
 			SAVE_PATH + "cluster_visualisation.png"
 		)
 
-	model = deepfit.DeepFit(REDUCED_FEATURE_SIZE, OUTPUT_HYP_CNT, FEATURE_MAP_SCALE, data.shape[0]).cuda()
+	model = deepfit.DeepFit(NUM_HYPOTHESIS, OUTPUT_HYP_CNT, FEATURE_MAP_SCALE, data.shape[0]).cuda()
 	optimiser = optim.Adam(model.parameters(), lr = LEARNING_RATE)
 
 	# Train the model over multiple epochs - assumes the number of correspondences over all the samples in a batch is constant or fixed
