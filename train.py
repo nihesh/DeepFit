@@ -17,13 +17,14 @@ NUM_SAMPLES = 10000
 
 # DGSAC Arguments
 TOPK = 60
-NUM_HYPOTHESIS = 100
+NUM_HYPOTHESIS = 1000
+REDUCED_FEATURE_SIZE = 100
 
 # Training Arugments
 FEATURE_MAP_SCALE = 4
 BATCH_SIZE = 5
 NUM_WORKERS = 0
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.01
 EPOCHS = 100
 OUTPUT_HYP_CNT = 1000
 
@@ -66,7 +67,7 @@ if(__name__ == "__main__"):
 
 	ResetWorkspace()
 	
-	dataset = dataset.DataReader(DATA_ROOT, TYPE, NUM_SAMPLES, TOPK, NUM_HYPOTHESIS)
+	dataset = dataset.DataReader(DATA_ROOT, TYPE, NUM_SAMPLES, TOPK, NUM_HYPOTHESIS, REDUCED_FEATURE_SIZE)
 	dataloader = torch.utils.data.DataLoader(dataset, batch_size = BATCH_SIZE, shuffle = True, num_workers = NUM_WORKERS)
 
 	# Visualise Density/Residual features for hand crafted feature space
@@ -78,7 +79,7 @@ if(__name__ == "__main__"):
 			SAVE_PATH + "cluster_visualisation.png"
 		)
 
-	model = deepfit.DeepFit(NUM_HYPOTHESIS, OUTPUT_HYP_CNT, FEATURE_MAP_SCALE, data.shape[0]).cuda()
+	model = deepfit.DeepFit(REDUCED_FEATURE_SIZE, OUTPUT_HYP_CNT, FEATURE_MAP_SCALE, data.shape[0]).cuda()
 	optimiser = optim.Adam(model.parameters(), lr = LEARNING_RATE)
 
 	# Train the model over multiple epochs - assumes the number of correspondences over all the samples in a batch is constant or fixed
@@ -94,35 +95,48 @@ if(__name__ == "__main__"):
 			batch_size = data.shape[0]
 			num_correspondences = data.shape[1]
 
-			true_distribution, true_state, num_structures = utils.compute_silhouette_order(data, label)
 			structure_id = 0
-			max_structures = len(true_distribution)	
+			# Assumes the labelling is continuous from 0....C where C is the number of structures and 0 is for outliers
+			max_structures = torch.max(label).item()	
+			# Compute a list of 2D tensors where 1D tensor at i, j denotes the distribution for jth structure of ith batch
+			ground_truth, num_structures = utils.get_structure_distribution(label)
 
 			# Initialise losses
 			dist_align_loss = 0
 			
 			# Create an empty initial state vector
-			state = torch.zeros([batch_size, num_correspondences]).float().cuda()
+			cur_state = torch.zeros([batch_size, num_correspondences]).float().cuda()
 
 			# Train as long as there are at least 2 datasets with the current structure we are trying to fit - pointnet's batch norm won't work otherwise
 			# It's ok if we skip fitting a structure for a dataset - It will get trained in subsequent iterations
-			while(structure_id < max_structures and true_distribution[structure_id].shape[0] > 1):
+			while(structure_id < max_structures and (num_structures >= (structure_id + 1)).sum() > 1):
 
 				# Identify all datasets with structure_id + 1 number of structures
 				cur_encoding = encoding[np.argwhere(num_structures >= (structure_id + 1)).reshape(-1)]
-				cur_state = state[np.argwhere(num_structures >= (structure_id + 1)).reshape(-1)]
 				cur_batch_size = cur_encoding.shape[0]
 
-				# HACK - Replace this
-				cur_state = true_state[structure_id]
+				# Remove the batch items from ground truth which have lesser structures in this iteration
+				where = []
+				for i in range(len(ground_truth) - 1, -1, -1):
+					if(ground_truth[i].shape[0] == structure_id):
+						ground_truth.pop(i)
+					else:
+						where.append(i)
+				where.sort()
+
+				# Remove all expired batch items from cur_state
+				where = np.asarray(where)
+				cur_state = cur_state[where]
 
 				# Generate embedding from pointnet
 				embedding, distribution = model(cur_encoding, cur_state)
 
-				print(distribution[0][:20])
-				print(true_distribution[structure_id][0][:20])
+				true_distribution, cur_state = utils.find_approximate_match(distribution, cur_state, ground_truth)
 
-				bce = loss.dist_align_bce(true_distribution[structure_id], distribution)
+				print(distribution[0][:20])
+				print(true_distribution[0][:20])
+
+				bce = loss.dist_align_bce(true_distribution, distribution)
 				dist_align_loss += bce * cur_batch_size
 
 				total_cnt += cur_batch_size

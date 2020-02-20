@@ -10,10 +10,11 @@ from src.dgsac import DGSAC_Features, Residual_Features
 from src.constants import SEED
 import torch
 import time
+from sklearn.decomposition import PCA
 
 class DataReader(Dataset):
 
-	def __init__(self, data_root, structure, num_samples, topk, num_hypothesis = 1000, verbose = False):
+	def __init__(self, data_root, structure, num_samples, topk, num_hypothesis = 1000, reduced_feature_size = 100, verbose = False):
 
 		"""
 		Homography dataset reader - All operations within the dataset happens in doubles but values are returned in float by __getitem__()
@@ -43,6 +44,8 @@ class DataReader(Dataset):
 			self.files[i] = os.path.join(data_root, self.files[i])
 		random.Random(SEED).shuffle(self.files)
 
+		self.reducer = PCA(n_components = reduced_feature_size)
+
 	def __len__(self):
 
 		return len(self.files)
@@ -62,6 +65,9 @@ class DataReader(Dataset):
 	
 		feature_in_t = time.time()
 		encoding = DGSAC_Features(data, self.topk, self.structure, self.num_hypothesis, self.verbose) 
+		encoding = encoding.cpu().detach().numpy()
+		encoding = self.reducer.fit_transform(encoding)
+		encoding = torch.tensor(encoding).float().cuda()
 		# encoding = Residual_Features(data, self.topk, self.structure, self.num_hypothesis)
 		feature_out_t = time.time()
 

@@ -22,96 +22,6 @@ def nan_check(vector):
 
 	assert(not torch.isnan(vector).any() and not (vector == float("inf")).any())
 
-def compute_silhouette_order(data, label):
-
-	"""
-	Computes the order in which clusters are to be detected by the network
-	We try to ensure that easy clusters are detected first, followed by hard clusters.
-	Clusters with high mean silhouette scores are defined as easy clusters. 
-	Input:
-		data - [batch_size x num_correspondences x dim] 3D tensoor
-		label - [batch_size x num_correspondences] 2D tensor
-	Output:
-		true_distribution, true_state - list of size max number of clusters where ith item in the list is a 2D tensor
-										of shape [num_sets_in_batch_with_i_structures x num_correspondences]
-		num_structures 				  - [batch_size] 1D numpy array denoting the number of structures in the ith batch
-	""" 
-
-	batch_size = data.shape[0]
-	num_correspondences = data.shape[1]
-
-	# Compute pairwise distance between all the points
-	distance = data.unsqueeze(2) - data.unsqueeze(1)
-	distance = torch.pow(torch.pow(distance, 2).sum(dim = 3), 0.5)
-
-	distance = distance.cpu().detach().numpy()
-	label = label.cpu().detach().numpy()
-	
-	num_structures = []
-	distribution = []
-	state = []
-	max_labels = 0
-
-	for i in range(batch_size):
-		
-		sh = sklearn.metrics.silhouette_samples(distance[i], label[i])
-		
-		# Compute mean silhouette score for all the labels except label 0 - outlier class
-		cur_labels = list(set(label[i]))
-		num_labels = len(cur_labels) - 1
-		# Add the number of structures in the current batch to the collection
-		num_structures.append(num_labels)
-		# Compute max structures oover all batches
-		max_labels = max(max_labels, num_labels)
-
-		mean_score = []
-		for l in cur_labels:
-
-			# Skip if outlier
-			if(l == 0):
-				continue
-
-			# Compute mean silhouette score of all samples belonging to structure l
-			mean_score.append([np.mean(sh[label[i] == l]), l])
-
-		# Sort structure silhouette scores from high to low
-		mean_score.sort(reverse = True)
-
-		# Create the probability matrix where row[j][k] = 1 iff mean_score[j][1] == label[k]
-		# state vector is just the cumulative sum of probability vectors
-		_dis = torch.zeros([num_labels, num_correspondences]).float().cuda()
-		_state = torch.zeros([num_labels, num_correspondences]).float().cuda()
-		cur_state = torch.zeros([num_correspondences]).float().cuda()
-		for j in range(num_labels):
-			_state[j] = cur_state
-			_dis[j, np.argwhere(label[i] == mean_score[j][1]).reshape(-1)] = 1
-			cur_state += _dis[j]
-		distribution.append(_dis)
-		state.append(_state)
-
-	# Convert num_structures collection to numpy array
-	num_structures = np.asarray(num_structures)
-
-	# Reorder distribution and state to compute loss in a vectorized fashion
-	true_distribution = []
-	true_state = []
-
-	for i in range(max_labels):
-		structure_i = []
-		state_i = []
-		for j in range(batch_size):
-			if(distribution[j].shape[0] <= i):
-				continue
-			structure_i.append(distribution[j][i].unsqueeze(0))
-			state_i.append(state[j][i].unsqueeze(0))
-		structure_i = torch.cat(structure_i, dim = 0)
-		state_i = torch.cat(state_i, dim = 0)
-
-		true_distribution.append(structure_i)
-		true_state.append(state_i)
-
-	return true_distribution, true_state, num_structures
-
 def shift_and_scale_norm(data):
 
 	"""
@@ -207,6 +117,75 @@ def normalise2dpts(data):
 	T[:, 1, 2] = -scale * mean[:, 1]
 
 	return data, T
+
+def get_structure_distribution(labels):
+
+	"""
+	This module operates on batches of labels and returns a list of 2D tensors, where the ith item in the list and jth tensor 
+	denotes the probability distribution of the jth structure and ith batch. output[i][j][k] == 1 iff kth point belongs to the jth
+	structure in the ith batch
+	Assumes the labelling is continuous from 0....C where C is the number of structures and 0 is for outliers
+
+	Input:
+		labels 					 - [batch_size x num_correspondences] 2D tensor denoting the structure membership of all the points in a batch
+	Output:
+		structure_distribution   - [batch_size x num_structures x num_samples] list of 2D tensors as described above
+		num_structures			 - [batch_size] 1D numpy array denoting the number of structures in a batch
+	"""
+
+	batch_size = labels.shape[0]
+	num_structures_collect = []
+
+	structure_distribution = []
+	for i in range(batch_size):
+
+		num_structures = torch.max(labels[i]).item()
+		num_correspondences = labels[i].shape[0]
+		st_dist_now = torch.zeros([num_structures + 1, num_correspondences]).float().cuda()
+
+		x_idx = labels[i].view(-1)
+		y_idx = torch.linspace(0, num_correspondences - 1, num_correspondences).long().cuda().view(-1)
+
+		st_dist_now[x_idx.cpu().detach().numpy(), y_idx.cpu().detach().numpy()] = 1
+		st_dist_now = st_dist_now[1:, :]
+
+		structure_distribution.append(st_dist_now)
+		num_structures_collect.append(num_structures)
+
+	return structure_distribution, np.asarray(num_structures_collect)
+
+def find_approximate_match(predicted, state, ground_truth):
+
+	"""
+	This function matches the predicted distribution with one of the ground truth distributions that doesn't favour choosing picked points, given by state
+	Intuitively, it tries to find the best remaining structure greedily based on a reward computed as predicted * ground_truth[i] - state * ground_truth[i] - (1 - ground_truth[i]) * predicted[i]
+	Input:
+		predicted 				- [batch_size x num_correspondences] 2D tensor describing the probability distribution
+		state 					- [batch_size x num_correspondences] 2D tensor describing the state
+		ground_truth 			- [batch_size x num_structures x num_correspondences] 
+	Output:	
+		align_distribution		- [batch_size x num_correspondences] 2D tensor with which predicted distribution should be aligned with
+	"""
+
+	batch_size = predicted.shape[0]
+	num_correspondences = predicted.shape[1]
+
+	matched_distribution = []
+
+	for i in range(batch_size):
+
+		reward = ground_truth[i] * (predicted[i] - state[i]).view(1, num_correspondences) - (1 - ground_truth[i]) * predicted[i].view(1, num_correspondences)
+		reward = reward.sum(dim = 1)
+		
+		max_reward, best = torch.max(reward, 0)
+
+		to_align_with = ground_truth[i][best].unsqueeze(0)
+		matched_distribution.append(to_align_with)
+
+	matched_distribution = torch.cat(matched_distribution, dim = 0)
+	state = torch.min(state + matched_distribution, torch.tensor([1]).float().cuda())
+
+	return matched_distribution, state
 
 if(__name__ == "__main__"):
 
