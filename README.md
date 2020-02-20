@@ -1,5 +1,5 @@
-Multi_Model_Fitting
-===================
+Deep Fit
+========
 
 This is the Python-3.6 implementation of our paper *Deep Robust Multi-Model Fitting* submitted to *ECCV 2020*
 
